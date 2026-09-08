@@ -1,0 +1,22 @@
+[Unit]
+Description=State capture collector (drain _outbox to spool)
+Documentation=file:///opt/state-capture-collector/docs/DAILY_OPS.md
+Requires=state-capture-collect.socket
+After=state-capture-collect.socket
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=2
+Nice=10
+EnvironmentFile=-/opt/state-capture-collector/etc/state-capture.env
+ExecStart=/opt/state-capture-collector/bin/state-capture collect --tick-secs 60
+SyslogIdentifier=state-capture-collect
+# Root: must prune _outbox in four different utility owners' work sqlite files.
+ReadWritePaths=/var/lib/state-capture /var/lib/entra-tenant-recon /var/lib/adsb-trip-journal /var/lib/tail-to-ticker /var/lib/faa-registry-mirror
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

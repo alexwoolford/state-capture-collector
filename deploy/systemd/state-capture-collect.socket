@@ -1,0 +1,12 @@
+[Unit]
+Description=State capture collector datagram (/run/state/collect.sock)
+Documentation=file:///opt/state-capture-collector/docs/DAILY_OPS.md
+
+[Socket]
+ListenDatagram=/run/state/collect.sock
+SocketMode=0666
+DirectoryMode=0755
+RemoveOnStop=false
+
+[Install]
+WantedBy=sockets.target
