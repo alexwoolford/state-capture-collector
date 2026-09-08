@@ -44,6 +44,14 @@ sudo /opt/state-capture-collector/bin/state-capture collect --once
 ls /var/lib/state-capture/spool/
 ```
 
+`capture.current` is incremental from when capture was enabled. After a feed break, or the first time a populated sqlite is captured, re-snapshot current rows into the spool (continues `_outbox` seq so later triggers cannot collide). Mini apply is unchanged:
+
+```bash
+sudo /opt/state-capture-collector/bin/state-capture collect --snapshot
+```
+
+Do not `UPDATE col=col` to storm triggers. Do not copy work sqlite to the Mini.
+
 Env: `/opt/state-capture-collector/etc/state-capture.env` (not overwritten on reinstall).
 
 The datagram is group-scoped (`SocketGroup=state-capture`, mode `0660`). `install.sh` creates that group and adds each utility user that exists on the host (`faa`, `tails`, `adsb`, `entra`). A fifth utility needs the same group membership or the nudge gets `EACCES` (same as a missing socket: `_outbox` stays until the 60s tick). The service still runs as root so it can prune `_outbox` in each owner's work file. Postgres is **not** configured on this host. There is no `DATABASE_URL`.
