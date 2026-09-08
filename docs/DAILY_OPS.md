@@ -48,6 +48,8 @@ ls /var/lib/state-capture/spool/
 
 ```bash
 sudo /opt/state-capture-collector/bin/state-capture collect --snapshot
+# one db, seq floor when Mini watermark is already ahead of sqlite:
+#   sudo ... collect --snapshot --db adsb-trip-journal --min-seq 10000004
 ```
 
 Do not `UPDATE col=col` to storm triggers. Do not copy work sqlite to the Mini.

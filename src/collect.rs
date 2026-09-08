@@ -16,6 +16,10 @@ pub struct CollectCfg {
     pub spool_dir: std::path::PathBuf,
     pub sock: std::path::PathBuf,
     pub tick: Duration,
+    /// Snapshot only this announce `db_name` (all announced dbs when None).
+    pub snapshot_db: Option<String>,
+    /// Floor for reserved `_outbox` seq (Mini watermark may be ahead of sqlite).
+    pub min_seq: Option<i64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -231,6 +235,8 @@ mod tests {
             spool_dir: spool,
             sock: dir.path().join("collect.sock"),
             tick: Duration::from_secs(60),
+            snapshot_db: None,
+            min_seq: None,
         };
         (dir, cfg, sqlite)
     }

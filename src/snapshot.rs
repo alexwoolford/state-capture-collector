@@ -23,6 +23,12 @@ use crate::spool;
 const BATCH: usize = 5_000;
 
 pub fn snapshot_all(cfg: &CollectCfg) -> Result<Vec<DrainStats>> {
+    if let Some(name) = cfg.snapshot_db.as_deref() {
+        return match snapshot_named(cfg, name)? {
+            Some(s) => Ok(vec![s]),
+            None => Ok(vec![]),
+        };
+    }
     let announced = announce::load_dir(&cfg.announce_dir)?;
     let mut stats = Vec::new();
     for a in announced {
@@ -62,6 +68,9 @@ pub fn snapshot_sqlite(cfg: &CollectCfg, src_db: &str, sqlite_path: &Path) -> Re
     if exists.is_none() {
         tracing::warn!(db = %src_db, path = %sqlite_path.display(), "no _outbox table");
         return Ok(None);
+    }
+    if let Some(min) = cfg.min_seq {
+        floor_outbox_seq(&conn, min)?;
     }
 
     let tables = captured_tables(&conn)?;
@@ -364,6 +373,37 @@ fn reserve_outbox_seq(conn: &Connection, n: i64) -> Result<i64> {
     Ok(first)
 }
 
+fn floor_outbox_seq(conn: &Connection, min: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let seq_tbl: i64 = tx
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = '_outbox'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let seq_out: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM _outbox", [], |r| r.get(0))?;
+    let cur = seq_tbl.max(seq_out);
+    if cur >= min {
+        tx.commit()?;
+        return Ok(());
+    }
+    let updated = tx.execute(
+        "UPDATE sqlite_sequence SET seq = ?1 WHERE name = '_outbox'",
+        [min],
+    )?;
+    if updated == 0 {
+        tx.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('_outbox', ?1)",
+            [min],
+        )?;
+    }
+    tracing::info!(min, was = cur, "floored _outbox sqlite_sequence");
+    tx.commit()?;
+    Ok(())
+}
+
 fn payload_from_insert_trigger(sql: &str) -> Option<Vec<String>> {
     let idx = sql.rfind("json_object(")?;
     let rest = &sql[idx + "json_object(".len()..];
@@ -541,6 +581,8 @@ mod tests {
             spool_dir: spool,
             sock: dir.path().join("collect.sock"),
             tick: std::time::Duration::from_secs(60),
+            snapshot_db: None,
+            min_seq: None,
         };
         (dir, cfg, sqlite)
     }
