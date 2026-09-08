@@ -5,6 +5,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use state_capture::apply;
 use state_capture::collect::{self, CollectCfg};
+use state_capture::snapshot;
 
 #[derive(Parser)]
 #[command(
@@ -49,6 +50,10 @@ struct CollectArgs {
     /// Drain every announce file once and exit (timer / tests).
     #[arg(long)]
     once: bool,
+    /// After draining `_outbox`, emit `I` events for every captured table's
+    /// current rows (re-snapshot). Exits. Does not storm UPDATE triggers.
+    #[arg(long)]
+    snapshot: bool,
 }
 
 #[derive(clap::Args)]
@@ -80,7 +85,13 @@ fn main() -> Result<()> {
                 sock: a.sock,
                 tick: Duration::from_secs(a.tick_secs),
             };
-            if a.once {
+            if a.snapshot {
+                let drained = collect::drain_all(&cfg)?;
+                tracing::info!(batches = drained.len(), "drain complete");
+                let stats = snapshot::snapshot_all(&cfg)?;
+                tracing::info!(batches = stats.len(), "snapshot complete");
+                Ok(())
+            } else if a.once {
                 let stats = collect::drain_all(&cfg)?;
                 tracing::info!(batches = stats.len(), "drain complete");
                 Ok(())
