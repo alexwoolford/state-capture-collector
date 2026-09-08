@@ -93,22 +93,21 @@ pub fn snapshot_sqlite(cfg: &CollectCfg, src_db: &str, sqlite_path: &Path) -> Re
             |r| r.get(0),
         )
         .unwrap_or(0);
-    let seq_hi = Some(hi);
-    let seq_lo = Some(hi - total as i64 + 1);
+    let seq_lo = hi - total as i64 + 1;
 
     tracing::info!(
         db = %src_db,
         rows = total,
         tables = tables.len(),
-        seq_lo = seq_lo.unwrap_or(0),
+        seq_lo,
         seq_hi = hi,
         "snapshot spooled"
     );
     Ok(Some(DrainStats {
         src_db: src_db.to_string(),
         rows: total,
-        seq_lo,
-        seq_hi,
+        seq_lo: Some(seq_lo),
+        seq_hi: Some(hi),
     }))
 }
 
