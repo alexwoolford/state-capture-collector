@@ -54,6 +54,12 @@ struct CollectArgs {
     /// current rows (re-snapshot). Exits. Does not storm UPDATE triggers.
     #[arg(long)]
     snapshot: bool,
+    /// With `--snapshot`, only this announce db_name.
+    #[arg(long)]
+    db: Option<String>,
+    /// With `--snapshot`, reserve seq above this (Mini watermark may be ahead).
+    #[arg(long)]
+    min_seq: Option<i64>,
 }
 
 #[derive(clap::Args)]
@@ -84,6 +90,8 @@ fn main() -> Result<()> {
                 spool_dir: a.spool_dir,
                 sock: a.sock,
                 tick: Duration::from_secs(a.tick_secs),
+                snapshot_db: a.db,
+                min_seq: a.min_seq,
             };
             if a.snapshot {
                 let drained = collect::drain_all(&cfg)?;
