@@ -4,7 +4,8 @@ Documentation=file:///opt/state-capture-collector/docs/DAILY_OPS.md
 
 [Socket]
 ListenDatagram=/run/state/collect.sock
-SocketMode=0666
+SocketGroup=state-capture
+SocketMode=0660
 DirectoryMode=0755
 RemoveOnStop=false
 

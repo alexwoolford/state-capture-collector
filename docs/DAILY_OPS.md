@@ -34,7 +34,7 @@ sudo ./deploy/install.sh
 
 | Unit | Role |
 |---|---|
-| `state-capture-collect.socket` | `/run/state/collect.sock` (mode 666, local datagram) |
+| `state-capture-collect.socket` | `/run/state/collect.sock` (mode `0660`, group `state-capture`) |
 | `state-capture-collect.service` | `--tick-secs 60` plus drain-on-nudge |
 
 ```bash
@@ -46,7 +46,7 @@ ls /var/lib/state-capture/spool/
 
 Env: `/opt/state-capture-collector/etc/state-capture.env` (not overwritten on reinstall).
 
-The service runs as root so it can prune `_outbox` in each owner's work file. Postgres is **not** configured on this host. There is no `DATABASE_URL`.
+The datagram is group-scoped (`SocketGroup=state-capture`, mode `0660`). `install.sh` creates that group and adds each utility user that exists on the host (`faa`, `tails`, `adsb`, `entra`). A fifth utility needs the same group membership or the nudge gets `EACCES` (same as a missing socket: `_outbox` stays until the 60s tick). The service still runs as root so it can prune `_outbox` in each owner's work file. Postgres is **not** configured on this host. There is no `DATABASE_URL`.
 
 Spool files: `/var/lib/state-capture/spool/{src_db}/{seq_lo}-{seq_hi}.jsonl` (tmp + fsync + rename). Mini rsyncs `*.jsonl` only.
 
