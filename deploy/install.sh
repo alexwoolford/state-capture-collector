@@ -43,6 +43,16 @@ mkdir -p "$PREFIX"/{bin,etc,docs,sql,scripts} \
   /run/state \
   /etc/systemd/system
 
+echo "== socket group =="
+if ! getent group state-capture >/dev/null; then
+  groupadd --system state-capture
+fi
+for u in faa tails adsb entra; do
+  if id "$u" >/dev/null 2>&1; then
+    usermod -aG state-capture "$u"
+  fi
+done
+
 echo "== install files =="
 install -m 0755 "$BIN_SRC" "$PREFIX/bin/state-capture"
 install -m 0644 "$ROOT/docs/DAILY_OPS.md" "$PREFIX/docs/DAILY_OPS.md"
