@@ -70,10 +70,10 @@ fn migrate_insert_upsert_idempotent() {
             "fetched_at": "2026-08-31T00:00:00Z"
         })),
     );
-    let first = apply::apply_events(&mut client, &[event.clone()]).unwrap();
+    let first = apply::apply_events(&mut client, std::slice::from_ref(&event)).unwrap();
     assert_eq!(first.events, 1);
     assert_eq!(first.inserted, 1);
-    let second = apply::apply_events(&mut client, &[event]).unwrap();
+    let second = apply::apply_events(&mut client, std::slice::from_ref(&event)).unwrap();
     assert_eq!(second.inserted, 0);
     let ticker: String = client
         .query_one(

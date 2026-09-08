@@ -12,8 +12,9 @@ Nice=10
 EnvironmentFile=-/opt/state-capture-collector/etc/state-capture.env
 ExecStart=/opt/state-capture-collector/bin/state-capture collect --tick-secs 60
 SyslogIdentifier=state-capture-collect
-# Root: must prune _outbox in four different utility owners' work sqlite files.
-ReadWritePaths=/var/lib/state-capture /var/lib/entra-tenant-recon /var/lib/adsb-trip-journal /var/lib/tail-to-ticker /var/lib/faa-registry-mirror
+# Root: prune _outbox in work sqlite named by announce JSON.
+# Extra /var/lib trees are host inventory: a systemd drop-in, not this unit.
+ReadWritePaths=/var/lib/state-capture
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true

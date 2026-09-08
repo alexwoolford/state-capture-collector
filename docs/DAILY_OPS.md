@@ -19,14 +19,9 @@ Operator logs: `tracing` on stderr → journald / launchd. Default `RUST_LOG=inf
 
 ## Watch work sqlite only
 
-| Logical name | Watched path |
-|---|---|
-| `entra-tenant-recon` | `/var/lib/entra-tenant-recon/entra.sqlite` |
-| `adsb-trip-journal` | `/var/lib/adsb-trip-journal/trips.sqlite` |
-| `tail-to-ticker` | `/var/lib/tail-to-ticker/work/current/tail_to_ticker.sqlite` |
-| `faa-registry-mirror` | `/var/lib/faa-registry-mirror/work/faa-registry.sqlite` |
+Collect reads `/var/lib/state-capture/announce/{db_name}.json` (`db_name`, `sqlite_path`). It does not ship a list of utilities. Never watch published `current/` copies (`VACUUM INTO` / `mv`).
 
-Never watch published `current/` copies (`VACUUM INTO` / `mv`).
+Which work trees exist on a given host is **host inventory** (a systemd drop-in adding `ReadWritePaths` so drain can prune `_outbox` in each owner's file). That overlay lives in the private mosaic repo, not this crate. A probe whose sqlite already sits under `/var/lib/state-capture/` needs no extra path.
 
 ## Oracle (systemd)
 
@@ -55,7 +50,7 @@ The service runs as root so it can prune `_outbox` in each owner's work file. Po
 
 Spool files: `/var/lib/state-capture/spool/{src_db}/{seq_lo}-{seq_hi}.jsonl` (tmp + fsync + rename). Mini rsyncs `*.jsonl` only.
 
-`ReadWritePaths` in the systemd unit is a filesystem ACL (so drain can prune `_outbox`), not a SQL schema. A fifth utility under a new `/var/lib/...` needs one unit line. A probe under `/var/lib/state-capture/` needs none.
+The shipped unit allows write only under `/var/lib/state-capture`. A utility whose work sqlite lives elsewhere needs a host drop-in on `ReadWritePaths` (filesystem ACL so drain can prune `_outbox`, not a SQL schema). Do not add tile names to this crate's unit file.
 
 ## Mini (launchd)
 
@@ -91,9 +86,9 @@ Apply is generic. The collector does not know `entra` vs `adsb` vs a fifth name.
 `I`/`U` upsert `capture.current` from `after` (a `U` with `deleted_at` set still upserts). `D` deletes that key. Query the payload, not typed warehouse columns:
 
 ```sql
-SELECT after->>'ticker'
+SELECT after->>'example_col'
 FROM capture.current
-WHERE src_db = 'tail-to-ticker' AND tbl = 'mappings_current';
+WHERE src_db = 'example-utility' AND tbl = 'example_table';
 ```
 
 Typed `adsb.trips`-style tables, if you want them later, are a separate Mini SQL/dbt layer on top of `capture.events`. They are not a reason to change this crate. If an earlier applyer created `entra` / `adsb` / `ttt` / `faa` schemas, drop those by hand; this binary no longer writes them.
