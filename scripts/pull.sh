@@ -17,12 +17,33 @@ fi
 : "${DATABASE_URL:?set DATABASE_URL for local Postgres}"
 REMOTE_SPOOL="${REMOTE_SPOOL:-/var/lib/state-capture/spool}"
 LOCAL_SPOOL="${LOCAL_SPOOL:-$HOME/var/state-capture/incoming}"
+FORGET_SPOOL="${FORGET_SPOOL:-/opt/state-capture-collector/scripts/forget-spool.sh}"
 
 mkdir -p "$LOCAL_SPOOL"
 rsync -a --include='*/' --include='*.jsonl' --exclude='*' \
   "${ORACLE_SSH}:${REMOTE_SPOOL}/" "${LOCAL_SPOOL}/"
 
+list_rel() {
+  (cd "$LOCAL_SPOOL" && find . -name '*.jsonl' | sed 's|^\./||' | sort)
+}
+
+before=$(mktemp)
+forget=$(mktemp)
+trap 'rm -f "$before" "$forget"' EXIT
+list_rel >"$before"
+
 "$BIN" apply --migrate --spool "$LOCAL_SPOOL" --database-url "$DATABASE_URL" --delete-after
 
-# Remote files stay until you prune them (store-and-forward). Optional:
-#   ssh "$ORACLE_SSH" "find $REMOTE_SPOOL -name '*.jsonl' -mtime +14 -delete"
+: >"$forget"
+while IFS= read -r rel; do
+  [[ -z "$rel" ]] && continue
+  if [[ ! -f "$LOCAL_SPOOL/$rel" ]]; then
+    printf '%s\n' "$rel"
+  fi
+done <"$before" >"$forget"
+
+if [[ -s "$forget" ]]; then
+  # sudoers on Oracle: NOPASSWD this script only. Missing sudo must fail the
+  # pull (do not age-delete as a fallback).
+  ssh "$ORACLE_SSH" "sudo -n $FORGET_SPOOL" <"$forget"
+fi

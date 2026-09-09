@@ -8,6 +8,10 @@ use anyhow::{Context, Result};
 
 use crate::event::Event;
 
+/// Closed JSONL page size. Snapshot and drain both use this so a large `_outbox`
+/// cannot become one Vec / one apply transaction.
+pub const JSONL_BATCH: usize = 5_000;
+
 pub fn write_batch(spool_dir: &Path, src_db: &str, events: &[Event]) -> Result<Option<PathBuf>> {
     if events.is_empty() {
         return Ok(None);
@@ -52,8 +56,26 @@ pub fn list_jsonl(spool: &Path) -> Result<Vec<PathBuf>> {
         return Ok(out);
     }
     walk_jsonl(spool, &mut out)?;
-    out.sort();
+    out.sort_by_key(|p| jsonl_sort_key(p));
     Ok(out)
+}
+
+/// `(src_db, seq_lo, seq_hi, path)` so `338-732.jsonl` applies before `10000741-…`.
+fn jsonl_sort_key(path: &Path) -> (String, i64, i64, PathBuf) {
+    let src_db = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let (lo, hi) = parse_lo_hi(stem).unwrap_or((i64::MAX, i64::MAX));
+    (src_db, lo, hi, path.to_path_buf())
+}
+
+fn parse_lo_hi(stem: &str) -> Option<(i64, i64)> {
+    let (lo, hi) = stem.split_once('-')?;
+    Some((lo.parse().ok()?, hi.parse().ok()?))
 }
 
 fn walk_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -72,4 +94,24 @@ fn walk_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_jsonl_orders_by_seq_not_path_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let faa = dir.path().join("faa-registry-mirror");
+        std::fs::create_dir_all(&faa).unwrap();
+        std::fs::write(faa.join("10000741-10000750.jsonl"), "{}\n").unwrap();
+        std::fs::write(faa.join("338-732.jsonl"), "{}\n").unwrap();
+        let files = list_jsonl(dir.path()).unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["338-732.jsonl", "10000741-10000750.jsonl"]);
+    }
 }

@@ -4,7 +4,7 @@ Drain SQLite `_outbox` tables on the Oracle host (`ct-firehose`) into closed JSO
 
 Same binary, different subcommands: `collect` is a full-time systemd daemon; `apply` runs from a 300s launchd timer via `scripts/pull.sh` and exits.
 
-See [docs/DAILY_OPS.md](docs/DAILY_OPS.md). Utilities join this bus by depending on [`capturable-state`](https://github.com/alexwoolford/capturable-state) (git tag). This crate stays schema-ignorant.
+See [docs/DAILY_OPS.md](docs/DAILY_OPS.md) (including [Scale and retention](docs/DAILY_OPS.md#scale-and-retention)). Utilities join this bus by depending on [`capturable-state`](https://github.com/alexwoolford/capturable-state) (git tag). This crate stays schema-ignorant.
 
 ```bash
 # Oracle (ct-firehose) — daemon

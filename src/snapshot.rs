@@ -20,8 +20,6 @@ use crate::collect::{CollectCfg, DrainStats};
 use crate::event::{validate_db_name, Event};
 use crate::spool;
 
-const BATCH: usize = 5_000;
-
 pub fn snapshot_all(cfg: &CollectCfg) -> Result<Vec<DrainStats>> {
     if let Some(name) = cfg.snapshot_db.as_deref() {
         return match snapshot_named(cfg, name)? {
@@ -50,7 +48,11 @@ pub fn snapshot_named(cfg: &CollectCfg, db_name: &str) -> Result<Option<DrainSta
     snapshot_sqlite(cfg, &a.db_name, Path::new(&a.sqlite_path))
 }
 
-pub fn snapshot_sqlite(cfg: &CollectCfg, src_db: &str, sqlite_path: &Path) -> Result<Option<DrainStats>> {
+pub fn snapshot_sqlite(
+    cfg: &CollectCfg,
+    src_db: &str,
+    sqlite_path: &Path,
+) -> Result<Option<DrainStats>> {
     validate_db_name(src_db)?;
     if !sqlite_path.is_file() {
         anyhow::bail!("sqlite missing: {}", sqlite_path.display());
@@ -181,13 +183,13 @@ fn snapshot_table(
     }
     let mut after_rowid: i64 = 0;
     loop {
-        let batch = fetch_rowid_page(conn, table, after_rowid, BATCH)?;
+        let batch = fetch_rowid_page(conn, table, after_rowid, spool::JSONL_BATCH)?;
         if batch.is_empty() {
             break;
         }
         after_rowid = batch.last().map(|r| r.rowid).unwrap_or(after_rowid);
         written += emit_batch(conn, cfg, src_db, table, ts, &batch)?;
-        if batch.len() < BATCH {
+        if batch.len() < spool::JSONL_BATCH {
             break;
         }
     }
@@ -238,7 +240,7 @@ fn snapshot_all_rows(
     let mut written = 0usize;
     while let Some(row) = rows.next()? {
         batch.push(row_snap(table, row, 0, col_count, 0)?);
-        if batch.len() >= BATCH {
+        if batch.len() >= spool::JSONL_BATCH {
             written += emit_batch(conn, cfg, src_db, table, ts, &batch)?;
             batch.clear();
         }
@@ -355,7 +357,9 @@ fn reserve_outbox_seq(conn: &Connection, n: i64) -> Result<i64> {
         )
         .optional()?
         .unwrap_or(0);
-    let seq_out: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM _outbox", [], |r| r.get(0))?;
+    let seq_out: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM _outbox", [], |r| {
+        r.get(0)
+    })?;
     let cur = seq_tbl.max(seq_out);
     let first = cur + 1;
     let last = cur + n;
@@ -383,7 +387,9 @@ fn floor_outbox_seq(conn: &Connection, min: i64) -> Result<()> {
         )
         .optional()?
         .unwrap_or(0);
-    let seq_out: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM _outbox", [], |r| r.get(0))?;
+    let seq_out: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM _outbox", [], |r| {
+        r.get(0)
+    })?;
     let cur = seq_tbl.max(seq_out);
     if cur >= min {
         tx.commit()?;
