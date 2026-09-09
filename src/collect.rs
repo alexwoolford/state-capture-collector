@@ -76,9 +76,58 @@ pub fn drain_sqlite(
         return Ok(None);
     }
 
-    let mut stmt =
-        conn.prepare("SELECT seq, tbl, op, ts, key, before, after FROM _outbox ORDER BY seq")?;
-    let rows = stmt.query_map([], |r| {
+    let mut total = 0usize;
+    let mut seq_lo = None;
+    let mut seq_hi = None;
+    let mut after_seq: i64 = 0;
+    loop {
+        let events = fetch_outbox_page(&conn, src_db, after_seq, spool::JSONL_BATCH)?;
+        if events.is_empty() {
+            break;
+        }
+        let lo = events[0].seq;
+        let hi = events[events.len() - 1].seq;
+        spool::write_batch(&cfg.spool_dir, src_db, &events)?;
+        conn.execute("DELETE FROM _outbox WHERE seq <= ?1", [hi])?;
+        total += events.len();
+        if seq_lo.is_none() {
+            seq_lo = Some(lo);
+        }
+        seq_hi = Some(hi);
+        after_seq = hi;
+        if events.len() < spool::JSONL_BATCH {
+            break;
+        }
+    }
+    if total == 0 {
+        return Ok(None);
+    }
+    tracing::info!(
+        db = %src_db,
+        rows = total,
+        seq_lo,
+        seq_hi,
+        "spooled _outbox"
+    );
+    Ok(Some(DrainStats {
+        src_db: src_db.to_string(),
+        rows: total,
+        seq_lo,
+        seq_hi,
+    }))
+}
+
+fn fetch_outbox_page(
+    conn: &Connection,
+    src_db: &str,
+    after_seq: i64,
+    limit: usize,
+) -> Result<Vec<Event>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq, tbl, op, ts, key, before, after FROM _outbox
+          WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![after_seq, limit as i64], |r| {
         Ok(OutboxRow {
             seq: r.get(0)?,
             tbl: r.get(1)?,
@@ -103,28 +152,7 @@ pub fn drain_sqlite(
             after: row.after.as_deref().and_then(parse_json),
         });
     }
-    if events.is_empty() {
-        return Ok(None);
-    }
-    let lo = events[0].seq;
-    let hi = events[events.len() - 1].seq;
-    let n = events.len();
-    spool::write_batch(&cfg.spool_dir, src_db, &events)?;
-    let n_del = conn.execute("DELETE FROM _outbox WHERE seq <= ?1", [hi])?;
-    tracing::info!(
-        db = %src_db,
-        rows = n,
-        seq_lo = lo,
-        seq_hi = hi,
-        pruned = n_del,
-        "spooled _outbox"
-    );
-    Ok(Some(DrainStats {
-        src_db: src_db.to_string(),
-        rows: n,
-        seq_lo: Some(lo),
-        seq_hi: Some(hi),
-    }))
+    Ok(events)
 }
 
 struct OutboxRow {
@@ -286,6 +314,37 @@ mod tests {
             .query_row("SELECT count(*) FROM _outbox", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn drain_pages_above_jsonl_batch() {
+        let (_d, cfg, sqlite) = setup();
+        let n = spool::JSONL_BATCH + 1;
+        let conn = Connection::open(&sqlite).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..n {
+            let key = format!(r#"{{"id":{i}}}"#);
+            tx.execute(
+                "INSERT INTO _outbox (tbl, op, ts, key, after) VALUES ('t', 'I', 1700000000, ?1, ?1)",
+                rusqlite::params![key],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let stats = drain_all(&cfg).unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].rows, n);
+        let files = spool::list_jsonl(&cfg.spool_dir).unwrap();
+        assert_eq!(files.len(), 2);
+        let left: i64 = Connection::open(&sqlite)
+            .unwrap()
+            .query_row("SELECT count(*) FROM _outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+        let lines0 = std::fs::read_to_string(&files[0]).unwrap().lines().count();
+        let lines1 = std::fs::read_to_string(&files[1]).unwrap().lines().count();
+        assert_eq!(lines0, spool::JSONL_BATCH);
+        assert_eq!(lines1, 1);
     }
 
     #[test]

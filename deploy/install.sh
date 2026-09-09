@@ -55,6 +55,7 @@ done
 
 echo "== install files =="
 install -m 0755 "$BIN_SRC" "$PREFIX/bin/state-capture"
+install -m 0755 "$ROOT/scripts/forget-spool.sh" "$PREFIX/scripts/forget-spool.sh"
 install -m 0644 "$ROOT/docs/DAILY_OPS.md" "$PREFIX/docs/DAILY_OPS.md"
 install -m 0644 "$ROOT/sql/001_capture.sql" "$PREFIX/sql/001_capture.sql"
 if [[ ! -f "$ENV_DST" ]]; then
@@ -78,6 +79,7 @@ echo "installed:"
 echo "  prefix=$PREFIX"
 echo "  announce=$STATE/announce"
 echo "  spool=$STATE/spool"
+echo "  forget-spool=$PREFIX/scripts/forget-spool.sh"
 echo "  sock=/run/state/collect.sock"
 echo "  env=$ENV_DST"
 echo "  journalctl -u state-capture-collect.service -n 50 --no-pager"

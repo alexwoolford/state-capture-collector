@@ -52,7 +52,7 @@ sudo /opt/state-capture-collector/bin/state-capture collect --snapshot
 #   sudo ... collect --snapshot --db adsb-trip-journal --min-seq 10000004
 ```
 
-Do not `UPDATE col=col` to storm triggers. Do not copy work sqlite to the Mini.
+Do not `UPDATE col=col` to storm triggers. Do not copy work sqlite to the Mini. Do not re-snapshot a large live table (FAA registry) as a refresh — that is how the spool and `capture.events` grow without bound ([Scale and retention](#scale-and-retention)).
 
 Env: `/opt/state-capture-collector/etc/state-capture.env` (not overwritten on reinstall).
 
@@ -78,12 +78,15 @@ Edit [deploy/macos/com.woolford.state-capture-pull.plist](../deploy/macos/com.wo
 
 ```bash
 cp deploy/macos/com.woolford.state-capture-pull.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.woolford.state-capture-pull.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.woolford.state-capture-pull.plist
+# already loaded: launchctl kickstart -k gui/$(id -u)/com.woolford.state-capture-pull
 ```
 
-Default interval is 300s. `pull.sh` deletes **local** copies after a successful apply (`--delete-after`). Remote spool is left for retention; prune by hand if the disk grows.
+Default interval is 300s. `pull.sh` rsyncs JSONL, applies with `--delete-after`, then `ssh sudo forget-spool.sh` for paths that disappeared locally. Missing sudo fails the pull (no mtime fallback). See [Scale and retention](#scale-and-retention).
 
-Idempotency: `PRIMARY KEY (src_db, seq)` on `capture.events` (`ON CONFLICT DO NOTHING`). `capture.current` upserts skip a row when the incoming `seq` is older than the stored one. Re-pulling the same JSONL is a no-op for the log.
+Idempotency: `PRIMARY KEY (src_db, seq)` on `capture.events` (`ON CONFLICT DO NOTHING`). Events already in the log are not re-applied to `current`. `I`/`U` refuse to recreate a row when `capture.events` already has a later `D` for that key. `list_jsonl` sorts by `(src_db, seq_lo)` parsed from `{lo}-{hi}.jsonl` (not path strings). Retract still runs after each file (`src_db`-scoped) to heal a current row that sits under a later `D`. `capture.current` upserts skip a row when the incoming `seq` is older than the stored one. Avoid overlapping `pull.sh` (launchd + manual) on the same incoming directory.
+
+Hung Mini apply: hours in `INSERT INTO capture.current` with `wait_event=DataFileRead` and no later `apply complete`. Cause: each new `I`/`U` seq-scanned `capture.events` for a later `D`. Fix: `events_d_key` in `sql/001_capture.sql` (`apply --migrate`). A long `inserted=0` apply over hundreds of files is a one-time replay of JSONL still on Oracle; after `forget-spool.sh` that should not repeat.
 
 ## Postgres shape
 
@@ -106,3 +109,21 @@ Typed `adsb.trips`-style tables, if you want them later, are a separate Mini SQL
 A fifth utility: depend on [`capturable-state`](https://github.com/alexwoolford/capturable-state) (`tag = "v0.1.0"`), write announce JSON, nudge `/run/state/collect.sock`. Collector and applyer stay unchanged.
 
 Envelope `ts` is Unix seconds. Fact dates inside `after` stay TEXT.
+
+## Scale and retention
+
+Low millions of JSONB rows are fine. `events_d_key` made new `I`/`U` cheap. Mini apply is O(JSONL still on Oracle). After a successful apply, `pull.sh` deletes those relative paths on Oracle (`forget-spool.sh`), so the next 300s pull is new files only.
+
+| Store | Bound? | Notes |
+|---|---|---|
+| Work `_outbox` | Yes | Drain pages 5_000 rows (same as snapshot), then deletes `seq <= hi`. |
+| Mini `incoming/` | Yes | `--delete-after` after each file commits. |
+| `capture.current` | Yes | Live keys only. FAA-sized (~800k) at 10× is still a small warehouse table. |
+| Oracle spool | Yes, after Mini apply | `/var/lib/state-capture/spool/{src_db}/{lo}-{hi}.jsonl` until `forget-spool.sh` removes the paths Mini just applied. |
+| `capture.events` | **No** | Append-only CDC log. Years of ticker/ads-b/entra is modest. Repeating FAA `--snapshot` is not. |
+
+Steady-state CDC (ads-b, ticker, entra) at 10× is noise next to one FAA snapshot. Do not `collect --snapshot` on `faa-registry-mirror` to refresh dictionaries.
+
+**Do not** delete spool files because `hi <= capture.watermarks.last_seq` — watermark is max seq, not a contiguous fill. **Do not** `find -mtime +14 -delete` while Mini might be behind; `_outbox` is already gone and the JSONL is the remaining copy.
+
+Oracle `forget-spool.sh` needs passwordless sudo for the SSH user (mosaic `deploy/ct-firehose/sudoers.d/state-capture-forget-spool`; on `ct-firehose` that user is `opc`). If sudo is missing, `pull.sh` exits non-zero. If the spool is already large, the next pull is a one-time replay; after forget, later pulls are new JSONL only.

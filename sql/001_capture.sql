@@ -18,6 +18,10 @@ CREATE TABLE IF NOT EXISTS capture.watermarks (
 );
 
 CREATE INDEX IF NOT EXISTS events_tbl ON capture.events (src_db, tbl);
+-- Later-D lookup for apply_current / retract_stale_current. Without this,
+-- each I/U seq-scans capture.events (~250ms, ~1.4M rows) and Mini hangs.
+CREATE INDEX IF NOT EXISTS events_d_key ON capture.events (src_db, tbl, key, seq)
+  WHERE op = 'D';
 
 CREATE TABLE IF NOT EXISTS capture.current (
   src_db TEXT NOT NULL,
