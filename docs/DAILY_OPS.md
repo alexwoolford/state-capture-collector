@@ -106,7 +106,7 @@ WHERE src_db = 'example-utility' AND tbl = 'example_table';
 
 Typed `adsb.trips`-style tables, if you want them later, are a separate Mini SQL/dbt layer on top of `capture.events`. They are not a reason to change this crate. If an earlier applyer created `entra` / `adsb` / `ttt` / `faa` schemas, drop those by hand; this binary no longer writes them.
 
-A fifth utility: depend on [`capturable-state`](https://github.com/alexwoolford/capturable-state) (`tag = "v0.1.0"`), write announce JSON, nudge `/run/state/collect.sock`. Collector and applyer stay unchanged.
+A fifth utility: depend on [`capturable-state`](https://github.com/alexwoolford/capturable-state) (`tag = "v0.1.1"`), write announce JSON, nudge `/run/state/collect.sock`. Collector and applyer stay unchanged.
 
 Envelope `ts` is Unix seconds. Fact dates inside `after` stay TEXT.
 
