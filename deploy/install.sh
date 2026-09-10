@@ -38,7 +38,7 @@ test -x "$BIN_SRC" || {
 }
 
 echo "== dirs =="
-mkdir -p "$PREFIX"/{bin,etc,docs,sql,scripts} \
+mkdir -p "$PREFIX"/{bin,etc,docs,scripts} \
   "$STATE"/{announce,spool} \
   /run/state \
   /etc/systemd/system
@@ -57,7 +57,6 @@ echo "== install files =="
 install -m 0755 "$BIN_SRC" "$PREFIX/bin/state-capture"
 install -m 0755 "$ROOT/scripts/forget-spool.sh" "$PREFIX/scripts/forget-spool.sh"
 install -m 0644 "$ROOT/docs/DAILY_OPS.md" "$PREFIX/docs/DAILY_OPS.md"
-install -m 0644 "$ROOT/sql/001_capture.sql" "$PREFIX/sql/001_capture.sql"
 if [[ ! -f "$ENV_DST" ]]; then
   install -m 0600 "$ROOT/deploy/state-capture.env.example" "$ENV_DST"
 fi

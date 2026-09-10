@@ -7,7 +7,7 @@ use state_capture::apply;
 use state_capture::collect::{self, CollectCfg};
 use state_capture::snapshot;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(
     name = "state-capture",
     about = "Drain SQLite _outbox to a spool; apply JSONL into local Postgres"
@@ -17,7 +17,7 @@ struct Cli {
     cmd: Cmd,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Cmd {
     /// Oracle: drain announced work sqlite `_outbox` into closed JSONL files.
     Collect(CollectArgs),
@@ -25,7 +25,7 @@ enum Cmd {
     Apply(ApplyArgs),
 }
 
-#[derive(clap::Args)]
+#[derive(clap::Args, Debug)]
 struct CollectArgs {
     #[arg(
         long,
@@ -50,19 +50,20 @@ struct CollectArgs {
     /// Drain every announce file once and exit (timer / tests).
     #[arg(long)]
     once: bool,
-    /// After draining `_outbox`, emit `I` events for every captured table's
-    /// current rows (re-snapshot). Exits. Does not storm UPDATE triggers.
+    /// Drain `_outbox` under a write lock, then emit `I` events for every
+    /// captured table's current rows (re-snapshot). Exits. Does not storm
+    /// UPDATE triggers. Blocks writers on that sqlite until commit.
     #[arg(long)]
     snapshot: bool,
     /// With `--snapshot`, only this announce db_name.
-    #[arg(long)]
+    #[arg(long, requires = "snapshot")]
     db: Option<String>,
-    /// With `--snapshot`, reserve seq above this (Mini watermark may be ahead).
-    #[arg(long)]
+    /// With `--snapshot --db`, reserve seq above this (Mini watermark may be ahead).
+    #[arg(long, requires = "db")]
     min_seq: Option<i64>,
 }
 
-#[derive(clap::Args)]
+#[derive(clap::Args, Debug)]
 struct ApplyArgs {
     #[arg(long, env = "STATE_CAPTURE_SPOOL_DIR")]
     spool: Option<PathBuf>,
@@ -94,8 +95,6 @@ fn main() -> Result<()> {
                 min_seq: a.min_seq,
             };
             if a.snapshot {
-                let drained = collect::drain_all(&cfg)?;
-                tracing::info!(batches = drained.len(), "drain complete");
                 let stats = snapshot::snapshot_all(&cfg)?;
                 tracing::info!(batches = stats.len(), "snapshot complete");
                 Ok(())
@@ -137,5 +136,36 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn min_seq_requires_db() {
+        let err = Cli::try_parse_from(["state-capture", "collect", "--snapshot", "--min-seq", "1"])
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("min-seq") && msg.contains("db"),
+            "unexpected clap error: {msg}"
+        );
+    }
+
+    #[test]
+    fn min_seq_and_db_require_snapshot() {
+        let err = Cli::try_parse_from([
+            "state-capture",
+            "collect",
+            "--db",
+            "adsb-trip-journal",
+            "--min-seq",
+            "1",
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("snapshot") || msg.contains("db"), "{msg}");
     }
 }

@@ -9,19 +9,38 @@ Two agents, one binary (`state-capture`). Oracle never connects to Postgres on t
 
 Collect writes closed JSONL under `/var/lib/state-capture/spool`. The Mini **grabs** those files; it does not open work sqlite. Missing `/run/state/collect.sock` is ignored by utilities (`ECONNREFUSED`). `_outbox` is the source of truth until drain.
 
-The Unix datagram `/run/state/collect.sock` is a **wake**. Payload is `db_name` bytes, not a row. Announce files are `/var/lib/state-capture/announce/{db_name}.json` (`db_name`, `sqlite_path`). A fifth utility depends on [`capturable-state`](https://github.com/alexwoolford/capturable-state) at a git tag, writes announce JSON, and nudges the same socket. It does not get its own collector.
+The Unix datagram `/run/state/collect.sock` is a **wake**. Payload is `db_name` bytes, not a row. Announce files are `/var/lib/state-capture/announce/{db_name}.json` (`db_name`, `sqlite_path`; filename stem must equal `db_name`). A fifth utility depends on [`capturable-state`](https://github.com/alexwoolford/capturable-state) at a git tag, writes announce JSON, and nudges the same socket. It does not get its own collector.
+
+## Collector contract
+
+This crate does not depend on `capturable-state`. It assumes:
+
+- Table `_outbox(seq, tbl, op, ts, key, before, after)` with monotonic `seq`
+- Insert triggers named `_cap_I_{table}` whose last `json_object(` is the captured `after` payload
+- Announce JSON `{db_name, sqlite_path}` at `{announce_dir}/{db_name}.json`
 
 ## Scheduler and telemetry
 
 `collect` is a `Type=simple` daemon (socket activation + 60s tick). `apply` is launchd `StartInterval` 300s, not a resident process. Do not put a cron inside the binary.
 
-Operator logs: `tracing` on stderr → journald / launchd. Default `RUST_LOG=info`. The 60s tick is a freshness fallback, not a job scheduler for utilities.
+Operator logs: `tracing` on stderr → journald / launchd. Default `RUST_LOG=info`. The 60s tick is a freshness fallback, not a job scheduler for utilities. Production tick is the unit's `--tick-secs 60` (`ExecStart`). It is not an environment variable.
+
+`--once` and `--snapshot` exit non-zero if any announced database failed (after attempting the rest). The daemon logs per-DB failures and keeps running.
 
 ## Watch work sqlite only
 
 Collect reads `/var/lib/state-capture/announce/{db_name}.json` (`db_name`, `sqlite_path`). It does not ship a list of utilities. Never watch published `current/` copies (`VACUUM INTO` / `mv`).
 
-Which work trees exist on a given host is **host inventory** (a systemd drop-in adding `ReadWritePaths` so drain can prune `_outbox` in each owner's file). That overlay lives in the private mosaic repo, not this crate. A probe whose sqlite already sits under `/var/lib/state-capture/` needs no extra path.
+Which work trees exist on a given host is **host inventory**. Drain must `DELETE` from `_outbox` in each utility's work sqlite; those files are not under `/var/lib/state-capture/` (announce + spool only). The overlay is a systemd drop-in in the private mosaic repo (`deploy/ct-firehose/state-capture-collect.service.d/10-utility-paths.conf`), not this crate. On `ct-firehose` that drop-in already lists the four work-tree parents:
+
+| Announce `db_name` | Work sqlite |
+|---|---|
+| `adsb-trip-journal` | `/var/lib/adsb-trip-journal/trips.sqlite` |
+| `entra-tenant-recon` | `/var/lib/entra-tenant-recon/entra.sqlite` |
+| `faa-registry-mirror` | `/var/lib/faa-registry-mirror/work/faa-registry.sqlite` |
+| `tail-to-ticker` | `/var/lib/tail-to-ticker/work/current/tail_to_ticker.sqlite` |
+
+A probe whose sqlite already sits under `/var/lib/state-capture/` needs no extra path.
 
 ## Oracle (systemd)
 
@@ -44,7 +63,9 @@ sudo /opt/state-capture-collector/bin/state-capture collect --once
 ls /var/lib/state-capture/spool/
 ```
 
-`capture.current` is incremental from when capture was enabled. After a feed break, or the first time a populated sqlite is captured, re-snapshot current rows into the spool (continues `_outbox` seq so later triggers cannot collide). Mini apply is unchanged:
+`capture.current` is incremental from when capture was enabled. After a feed break, or the first time a populated sqlite is captured, re-snapshot current rows into the spool (continues `_outbox` seq so later triggers cannot collide). Mini apply is unchanged.
+
+`collect --snapshot` takes `BEGIN IMMEDIATE` on **that** work sqlite (writers blocked until commit), drains `_outbox` into the spool, then emits `I` events for current rows of each `_cap_I_*` table. `--db` snapshots only that announce name (does not drain sibling databases). `--min-seq` requires `--db`.
 
 ```bash
 sudo /opt/state-capture-collector/bin/state-capture collect --snapshot
@@ -54,13 +75,13 @@ sudo /opt/state-capture-collector/bin/state-capture collect --snapshot
 
 Do not `UPDATE col=col` to storm triggers. Do not copy work sqlite to the Mini. Do not re-snapshot a large live table (FAA registry) as a refresh — that is how the spool and `capture.events` grow without bound ([Scale and retention](#scale-and-retention)).
 
-Env: `/opt/state-capture-collector/etc/state-capture.env` (not overwritten on reinstall).
+Env: `/opt/state-capture-collector/etc/state-capture.env` (not overwritten on reinstall). Paths only (`STATE_CAPTURE_SOCK`, `STATE_CAPTURE_ANNOUNCE_DIR`, `STATE_CAPTURE_SPOOL_DIR`).
 
 The datagram is group-scoped (`SocketGroup=state-capture`, mode `0660`). `install.sh` creates that group and adds each utility user that exists on the host (`faa`, `tails`, `adsb`, `entra`). A fifth utility needs the same group membership or the nudge gets `EACCES` (same as a missing socket: `_outbox` stays until the 60s tick). The service still runs as root so it can prune `_outbox` in each owner's work file. Postgres is **not** configured on this host. There is no `DATABASE_URL`.
 
 Spool files: `/var/lib/state-capture/spool/{src_db}/{seq_lo}-{seq_hi}.jsonl` (tmp + fsync + rename). Mini rsyncs `*.jsonl` only.
 
-The shipped unit allows write only under `/var/lib/state-capture`. A utility whose work sqlite lives elsewhere needs a host drop-in on `ReadWritePaths` (filesystem ACL so drain can prune `_outbox`, not a SQL schema). Do not add tile names to this crate's unit file.
+The shipped unit sets `ProtectSystem=strict`, `ReadWritePaths=/var/lib/state-capture`, and `ProtectHome=true`. Work sqlite outside that tree is writable only because mosaic's drop-in **adds** those parents (systemd merges `ReadWritePaths`; it does not replace them). `install.sh` overwrites the unit file and does **not** touch `/etc/systemd/system/state-capture-collect.service.d/`. Keep that drop-in when enabling `ProtectSystem=strict`. Do not add tile names to this crate's unit file.
 
 ## Mini (launchd)
 
@@ -74,7 +95,7 @@ cargo build --release
 ./scripts/pull.sh
 ```
 
-Edit [deploy/macos/com.woolford.state-capture-pull.plist](../deploy/macos/com.woolford.state-capture-pull.plist) (`ORACLE_SSH`, `DATABASE_URL`, path to `pull.sh`), then:
+Edit [deploy/macos/com.woolford.state-capture-pull.plist](../deploy/macos/com.woolford.state-capture-pull.plist) (`ORACLE_SSH`, `DATABASE_URL`, and the path to `pull.sh`). The checked-in plist uses `$HOME/state-capture-collector/scripts/pull.sh` as an example, not a guaranteed clone location. Then:
 
 ```bash
 cp deploy/macos/com.woolford.state-capture-pull.plist ~/Library/LaunchAgents/
@@ -82,9 +103,9 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.woolford.state-captu
 # already loaded: launchctl kickstart -k gui/$(id -u)/com.woolford.state-capture-pull
 ```
 
-Default interval is 300s. `pull.sh` rsyncs JSONL, applies with `--delete-after`, then `ssh sudo forget-spool.sh` for paths that disappeared locally. Missing sudo fails the pull (no mtime fallback). See [Scale and retention](#scale-and-retention).
+Default interval is 300s. `pull.sh` takes an exclusive lock on the incoming directory (`flock` when present, otherwise Python `fcntl.flock`), rsyncs JSONL, applies with `--delete-after`, then `ssh sudo forget-spool.sh` for paths that disappeared locally. A second pull while one is running exits non-zero. Missing sudo fails the pull (no mtime fallback). See [Scale and retention](#scale-and-retention).
 
-Idempotency: `PRIMARY KEY (src_db, seq)` on `capture.events` (`ON CONFLICT DO NOTHING`). Events already in the log are not re-applied to `current`. `I`/`U` refuse to recreate a row when `capture.events` already has a later `D` for that key. `list_jsonl` sorts by `(src_db, seq_lo)` parsed from `{lo}-{hi}.jsonl` (not path strings). Retract still runs after each file (`src_db`-scoped) to heal a current row that sits under a later `D`. `capture.current` upserts skip a row when the incoming `seq` is older than the stored one. Avoid overlapping `pull.sh` (launchd + manual) on the same incoming directory.
+Idempotency: `PRIMARY KEY (src_db, seq)` on `capture.events` (`ON CONFLICT DO NOTHING`). Events already in the log are not re-applied to `current`. `I`/`U` refuse to recreate a row when `capture.events` already has a later `D` for that key. `list_jsonl` sorts by `(src_db, seq_lo)` parsed from `{lo}-{hi}.jsonl` (not path strings). After a file that skipped duplicates, retract runs (`src_db`-scoped) to heal a current row that sits under a later `D`. `capture.current` upserts skip a row when the incoming `seq` is older than the stored one.
 
 Hung Mini apply: hours in `INSERT INTO capture.current` with `wait_event=DataFileRead` and no later `apply complete`. Cause: each new `I`/`U` seq-scanned `capture.events` for a later `D`. Fix: `events_d_key` in `sql/001_capture.sql` (`apply --migrate`). A long `inserted=0` apply over hundreds of files is a one-time replay of JSONL still on Oracle; after `forget-spool.sh` that should not repeat.
 
