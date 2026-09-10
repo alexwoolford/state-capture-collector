@@ -77,12 +77,14 @@ pub fn apply_events(client: &mut Client, events: &[Event]) -> Result<ApplyStats>
         return Ok(stats);
     }
     let mut tx = client.transaction()?;
+    let mut skipped = false;
     for ev in events {
         let n = insert_event(&mut tx, ev)?;
         stats.inserted += n;
         if n == 0 {
             // Already in capture.events (re-rsync of the whole spool). Do not
             // re-apply I/U after a later D — lexical jsonl names are not seq order.
+            skipped = true;
             bump_watermark(&mut tx, &ev.src_db, ev.seq)?;
             continue;
         }
@@ -90,8 +92,10 @@ pub fn apply_events(client: &mut Client, events: &[Event]) -> Result<ApplyStats>
             .with_context(|| format!("current {} {} seq {}", ev.src_db, ev.tbl, ev.seq))?;
         bump_watermark(&mut tx, &ev.src_db, ev.seq)?;
     }
-    // Re-rsync skip (n=0) does not re-run D. Heal rows a later D already retired.
-    retract_stale_current(&mut tx, &events[0].src_db)?;
+    // Replay skip (n=0) does not re-run D. Heal rows a later D already retired.
+    if skipped {
+        retract_stale_current(&mut tx, &events[0].src_db)?;
+    }
     tx.commit()?;
     Ok(stats)
 }

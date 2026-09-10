@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Mini: SSH-pull closed JSONL from Oracle, apply into local Postgres.
 # Does not open a path from Oracle to this machine.
+# Exclusive lock on $LOCAL_SPOOL/.pull.lock so a slow apply cannot overlap
+# the next launchd interval (flock(1), else Python fcntl.flock on fd 9).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,6 +22,20 @@ LOCAL_SPOOL="${LOCAL_SPOOL:-$HOME/var/state-capture/incoming}"
 FORGET_SPOOL="${FORGET_SPOOL:-/opt/state-capture-collector/scripts/forget-spool.sh}"
 
 mkdir -p "$LOCAL_SPOOL"
+LOCK="$LOCAL_SPOOL/.pull.lock"
+exec 9>"$LOCK"
+if command -v flock >/dev/null 2>&1; then
+  flock -n 9 || {
+    echo "pull already running (lock $LOCK)" >&2
+    exit 1
+  }
+else
+  python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)' || {
+    echo "pull already running (lock $LOCK)" >&2
+    exit 1
+  }
+fi
+
 rsync -a --include='*/' --include='*.jsonl' --exclude='*' \
   "${ORACLE_SSH}:${REMOTE_SPOOL}/" "${LOCAL_SPOOL}/"
 

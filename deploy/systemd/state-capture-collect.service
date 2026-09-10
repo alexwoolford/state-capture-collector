@@ -13,7 +13,8 @@ EnvironmentFile=-/opt/state-capture-collector/etc/state-capture.env
 ExecStart=/opt/state-capture-collector/bin/state-capture collect --tick-secs 60
 SyslogIdentifier=state-capture-collect
 # Root: prune _outbox in work sqlite named by announce JSON.
-# Extra /var/lib trees are host inventory: a systemd drop-in, not this unit.
+# Extra trees are host inventory: a systemd drop-in, not this unit.
+ProtectSystem=strict
 ReadWritePaths=/var/lib/state-capture
 ProtectHome=true
 PrivateTmp=true

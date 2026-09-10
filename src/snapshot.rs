@@ -5,6 +5,11 @@
 //! current row of each table that has `_cap_I_*` triggers. Seq is reserved in
 //! `sqlite_sequence` so later trigger inserts cannot collide.
 //!
+//! Each database is snapshotted under `BEGIN IMMEDIATE`: drain `_outbox`, then
+//! emit `I` events, then commit. Writers on that sqlite are blocked until
+//! commit so a concurrent `U` cannot land at seq N while snapshot emits a
+//! stale `I` at N+1.
+//!
 //! Does not `UPDATE col=col` (that would look like real changes). Does not
 //! open sqlite from the Mini.
 
@@ -12,11 +17,11 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Map, Value};
 
 use crate::announce;
-use crate::collect::{CollectCfg, DrainStats};
+use crate::collect::{self, CollectCfg, DrainStats};
 use crate::event::{validate_db_name, Event};
 use crate::spool;
 
@@ -29,12 +34,19 @@ pub fn snapshot_all(cfg: &CollectCfg) -> Result<Vec<DrainStats>> {
     }
     let announced = announce::load_dir(&cfg.announce_dir)?;
     let mut stats = Vec::new();
+    let mut failed = Vec::new();
     for a in announced {
         match snapshot_named(cfg, &a.db_name) {
             Ok(Some(s)) => stats.push(s),
             Ok(None) => {}
-            Err(e) => tracing::error!(db = %a.db_name, error = %e, "snapshot failed"),
+            Err(e) => {
+                tracing::error!(db = %a.db_name, error = %e, "snapshot failed");
+                failed.push(a.db_name);
+            }
         }
+    }
+    if !failed.is_empty() {
+        bail!("snapshot failed for: {}", failed.join(", "));
     }
     Ok(stats)
 }
@@ -57,58 +69,74 @@ pub fn snapshot_sqlite(
     if !sqlite_path.is_file() {
         anyhow::bail!("sqlite missing: {}", sqlite_path.display());
     }
-    let conn =
+    let mut conn =
         Connection::open(sqlite_path).with_context(|| format!("open {}", sqlite_path.display()))?;
     conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
-    let exists: Option<String> = conn
-        .query_row(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_outbox'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if exists.is_none() {
+    if !collect::has_outbox(&conn)? {
         tracing::warn!(db = %src_db, path = %sqlite_path.display(), "no _outbox table");
         return Ok(None);
     }
-    if let Some(min) = cfg.min_seq {
-        floor_outbox_seq(&conn, min)?;
-    }
-
-    let tables = captured_tables(&conn)?;
-    if tables.is_empty() {
-        tracing::warn!(db = %src_db, "no _cap_I_* triggers; nothing to snapshot");
-        return Ok(None);
-    }
-
-    let ts = now_ts();
-    let mut total = 0usize;
-
-    for table in &tables {
-        let n = snapshot_table(&conn, cfg, src_db, table, ts)?;
-        if n == 0 {
-            continue;
-        }
-        total += n;
-        tracing::info!(db = %src_db, tbl = %table.name, rows = n, "snapshot table");
-    }
-
-    if total == 0 {
-        return Ok(None);
-    }
-
-    let hi: i64 = conn
-        .query_row(
-            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = '_outbox'), 0)",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let seq_lo = hi - total as i64 + 1;
 
     tracing::info!(
         db = %src_db,
-        rows = total,
+        path = %sqlite_path.display(),
+        "snapshot holding write lock (BEGIN IMMEDIATE)"
+    );
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("BEGIN IMMEDIATE for snapshot")?;
+    let stats = snapshot_locked(cfg, src_db, &tx)?;
+    tx.commit().context("commit snapshot")?;
+    Ok(stats)
+}
+
+fn snapshot_locked(
+    cfg: &CollectCfg,
+    src_db: &str,
+    conn: &Connection,
+) -> Result<Option<DrainStats>> {
+    if let Some(min) = cfg.min_seq {
+        floor_outbox_seq(conn, min)?;
+    }
+
+    let drained = collect::drain_conn(cfg, src_db, conn)?;
+
+    let tables = captured_tables(conn)?;
+    if tables.is_empty() {
+        tracing::warn!(db = %src_db, "no _cap_I_* triggers; nothing to snapshot");
+        return Ok(drained);
+    }
+
+    let ts = now_ts();
+    let mut snap_rows = 0usize;
+    for table in &tables {
+        let n = snapshot_table(conn, cfg, src_db, table, ts)?;
+        if n == 0 {
+            continue;
+        }
+        snap_rows += n;
+        tracing::info!(db = %src_db, tbl = %table.name, rows = n, "snapshot table");
+    }
+
+    let drain_rows = drained.as_ref().map(|d| d.rows).unwrap_or(0);
+    let rows = drain_rows + snap_rows;
+    if rows == 0 {
+        return Ok(None);
+    }
+    let hi = current_outbox_seq(conn)?;
+    let seq_lo = drained.as_ref().and_then(|d| d.seq_lo).or({
+        if snap_rows == 0 {
+            None
+        } else {
+            Some(hi - snap_rows as i64 + 1)
+        }
+    });
+
+    tracing::info!(
+        db = %src_db,
+        rows,
+        drain_rows,
+        snap_rows,
         tables = tables.len(),
         seq_lo,
         seq_hi = hi,
@@ -116,8 +144,8 @@ pub fn snapshot_sqlite(
     );
     Ok(Some(DrainStats {
         src_db: src_db.to_string(),
-        rows: total,
-        seq_lo: Some(seq_lo),
+        rows,
+        seq_lo,
         seq_hi: Some(hi),
     }))
 }
@@ -149,12 +177,11 @@ fn captured_tables(conn: &Connection) -> Result<Vec<CapturedTable>> {
         validate_ident(&name)?;
         let cols = table_columns(conn, &name)?;
         let pk = pk_columns(&cols);
-        let payload = payload_from_insert_trigger(&sql).unwrap_or_else(|| {
-            cols.iter()
-                .filter(|c| c.typ != ColType::Blob)
-                .map(|c| c.name.clone())
-                .collect()
-        });
+        let payload = payload_from_insert_trigger(&sql).ok_or_else(|| {
+            anyhow::anyhow!(
+                "trigger {trig} has no parseable json_object payload (refusing all-column fallback)"
+            )
+        })?;
         for c in pk.iter().chain(payload.iter()) {
             validate_ident(c)?;
         }
@@ -252,12 +279,7 @@ fn snapshot_all_rows(
 }
 
 fn select_list(table: &CapturedTable) -> Result<String> {
-    let mut names: Vec<String> = table.pk.clone();
-    for c in &table.payload {
-        if !names.iter().any(|n| n == c) {
-            names.push(c.clone());
-        }
-    }
+    let names = ordered_cols(table);
     if names.is_empty() {
         bail!("{} has no key or payload columns", table.name);
     }
@@ -348,38 +370,25 @@ fn reserve_outbox_seq(conn: &Connection, n: i64) -> Result<i64> {
     if n <= 0 {
         bail!("reserve_outbox_seq n must be positive");
     }
-    let tx = conn.unchecked_transaction()?;
-    let seq_tbl: i64 = tx
-        .query_row(
-            "SELECT seq FROM sqlite_sequence WHERE name = '_outbox'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or(0);
-    let seq_out: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM _outbox", [], |r| {
-        r.get(0)
-    })?;
-    let cur = seq_tbl.max(seq_out);
+    let cur = current_outbox_seq(conn)?;
     let first = cur + 1;
     let last = cur + n;
-    let updated = tx.execute(
-        "UPDATE sqlite_sequence SET seq = ?1 WHERE name = '_outbox'",
-        [last],
-    )?;
-    if updated == 0 {
-        tx.execute(
-            "INSERT INTO sqlite_sequence(name, seq) VALUES ('_outbox', ?1)",
-            [last],
-        )?;
-    }
-    tx.commit()?;
+    set_outbox_seq(conn, last)?;
     Ok(first)
 }
 
 fn floor_outbox_seq(conn: &Connection, min: i64) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    let seq_tbl: i64 = tx
+    let cur = current_outbox_seq(conn)?;
+    if cur >= min {
+        return Ok(());
+    }
+    set_outbox_seq(conn, min)?;
+    tracing::info!(min, was = cur, "floored _outbox sqlite_sequence");
+    Ok(())
+}
+
+fn current_outbox_seq(conn: &Connection) -> Result<i64> {
+    let seq_tbl: i64 = conn
         .query_row(
             "SELECT seq FROM sqlite_sequence WHERE name = '_outbox'",
             [],
@@ -387,26 +396,23 @@ fn floor_outbox_seq(conn: &Connection, min: i64) -> Result<()> {
         )
         .optional()?
         .unwrap_or(0);
-    let seq_out: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM _outbox", [], |r| {
+    let seq_out: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM _outbox", [], |r| {
         r.get(0)
     })?;
-    let cur = seq_tbl.max(seq_out);
-    if cur >= min {
-        tx.commit()?;
-        return Ok(());
-    }
-    let updated = tx.execute(
+    Ok(seq_tbl.max(seq_out))
+}
+
+fn set_outbox_seq(conn: &Connection, seq: i64) -> Result<()> {
+    let updated = conn.execute(
         "UPDATE sqlite_sequence SET seq = ?1 WHERE name = '_outbox'",
-        [min],
+        [seq],
     )?;
     if updated == 0 {
-        tx.execute(
+        conn.execute(
             "INSERT INTO sqlite_sequence(name, seq) VALUES ('_outbox', ?1)",
-            [min],
+            [seq],
         )?;
     }
-    tracing::info!(min, was = cur, "floored _outbox sqlite_sequence");
-    tx.commit()?;
     Ok(())
 }
 
@@ -464,13 +470,6 @@ fn now_ts() -> i64 {
 struct Col {
     name: String,
     pk: i64,
-    typ: ColType,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ColType {
-    Blob,
-    Other,
 }
 
 fn table_columns(conn: &Connection, table: &str) -> Result<Vec<Col>> {
@@ -479,15 +478,9 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<Col>> {
         .with_context(|| format!("table_info {table}"))?;
     let cols = stmt
         .query_map([], |row| {
-            let typ: String = row.get(2)?;
             Ok(Col {
                 name: row.get(1)?,
                 pk: row.get(5)?,
-                typ: if typ.eq_ignore_ascii_case("BLOB") {
-                    ColType::Blob
-                } else {
-                    ColType::Other
-                },
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -634,10 +627,67 @@ mod tests {
             )
             .unwrap();
         let stats = snapshot_all(&cfg).unwrap();
-        assert_eq!(stats[0].seq_lo, Some(2));
+        assert_eq!(stats[0].rows, 3);
+        assert_eq!(stats[0].seq_lo, Some(1));
+        assert_eq!(stats[0].seq_hi, Some(3));
+        let left: i64 = Connection::open(&sqlite)
+            .unwrap()
+            .query_row("SELECT count(*) FROM _outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
         let files = spool::list_jsonl(&cfg.spool_dir).unwrap();
-        let body = fs::read_to_string(&files[0]).unwrap();
-        let ev: Event = serde_json::from_str(body.lines().next().unwrap()).unwrap();
-        assert_eq!(ev.seq, 2);
+        assert_eq!(files.len(), 2);
+        let drain_body = fs::read_to_string(&files[0]).unwrap();
+        let drain_ev: Event = serde_json::from_str(drain_body.lines().next().unwrap()).unwrap();
+        assert_eq!(drain_ev.op, "U");
+        assert_eq!(drain_ev.seq, 1);
+        let snap_body = fs::read_to_string(&files[1]).unwrap();
+        let snap_ev: Event = serde_json::from_str(snap_body.lines().next().unwrap()).unwrap();
+        assert_eq!(snap_ev.op, "I");
+        assert_eq!(snap_ev.seq, 2);
+    }
+
+    #[test]
+    fn snapshot_payload_omits_excluded_column() {
+        let names = payload_from_insert_trigger(
+            r#"
+            CREATE TRIGGER _cap_I_jobs AFTER INSERT ON jobs BEGIN
+              INSERT INTO _outbox(tbl, op, key, before, after)
+              VALUES ('jobs', 'I', json_object('id', NEW.id), NULL,
+                      json_object('id', NEW.id, 'state', NEW.state));
+            END;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(names, ["id", "state"]);
+        assert!(!names.iter().any(|n| n == "secret"));
+    }
+
+    #[test]
+    fn snapshot_refuses_all_column_fallback_without_json_object() {
+        let (_d, cfg, sqlite) = setup();
+        Connection::open(&sqlite)
+            .unwrap()
+            .execute_batch(
+                r#"
+                DROP TRIGGER _cap_I_jobs;
+                CREATE TRIGGER _cap_I_jobs AFTER INSERT ON jobs BEGIN
+                  INSERT INTO _outbox(tbl, op, key, before, after)
+                  VALUES ('jobs', 'I', '{}', NULL, NULL);
+                END;
+                "#,
+            )
+            .unwrap();
+        let err = snapshot_all(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("json_object") || err.contains("demo"),
+            "unexpected error: {err}"
+        );
+        assert!(spool::list_jsonl(&cfg.spool_dir).unwrap().is_empty());
+        let secret_leaked = spool::list_jsonl(&cfg.spool_dir)
+            .unwrap()
+            .iter()
+            .any(|p| fs::read_to_string(p).unwrap().contains("secret"));
+        assert!(!secret_leaked);
     }
 }

@@ -33,12 +33,19 @@ pub struct DrainStats {
 pub fn drain_all(cfg: &CollectCfg) -> Result<Vec<DrainStats>> {
     let announced = announce::load_dir(&cfg.announce_dir)?;
     let mut stats = Vec::new();
+    let mut failed = Vec::new();
     for a in announced {
         match drain_named(cfg, &a.db_name) {
             Ok(Some(s)) => stats.push(s),
             Ok(None) => {}
-            Err(e) => tracing::error!(db = %a.db_name, error = %e, "drain failed"),
+            Err(e) => {
+                tracing::error!(db = %a.db_name, error = %e, "drain failed");
+                failed.push(a.db_name);
+            }
         }
+    }
+    if !failed.is_empty() {
+        anyhow::bail!("drain failed for: {}", failed.join(", "));
     }
     Ok(stats)
 }
@@ -64,6 +71,14 @@ pub fn drain_sqlite(
     let conn =
         Connection::open(sqlite_path).with_context(|| format!("open {}", sqlite_path.display()))?;
     conn.busy_timeout(Duration::from_millis(5_000))?;
+    if !has_outbox(&conn)? {
+        tracing::warn!(db = %src_db, path = %sqlite_path.display(), "no _outbox table");
+        return Ok(None);
+    }
+    drain_conn(cfg, src_db, &conn)
+}
+
+pub(crate) fn has_outbox(conn: &Connection) -> Result<bool> {
     let exists: Option<String> = conn
         .query_row(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_outbox'",
@@ -71,17 +86,21 @@ pub fn drain_sqlite(
             |r| r.get(0),
         )
         .optional()?;
-    if exists.is_none() {
-        tracing::warn!(db = %src_db, path = %sqlite_path.display(), "no _outbox table");
-        return Ok(None);
-    }
+    Ok(exists.is_some())
+}
 
+/// Drain `_outbox` on an already-open connection (caller holds any write lock).
+pub(crate) fn drain_conn(
+    cfg: &CollectCfg,
+    src_db: &str,
+    conn: &Connection,
+) -> Result<Option<DrainStats>> {
     let mut total = 0usize;
     let mut seq_lo = None;
     let mut seq_hi = None;
     let mut after_seq: i64 = 0;
     loop {
-        let events = fetch_outbox_page(&conn, src_db, after_seq, spool::JSONL_BATCH)?;
+        let events = fetch_outbox_page(conn, src_db, after_seq, spool::JSONL_BATCH)?;
         if events.is_empty() {
             break;
         }
@@ -147,9 +166,9 @@ fn fetch_outbox_page(
             tbl: row.tbl,
             op: row.op,
             ts: row.ts,
-            key: parse_json(&row.key).unwrap_or(Value::String(row.key)),
-            before: row.before.as_deref().and_then(parse_json),
-            after: row.after.as_deref().and_then(parse_json),
+            key: required_json(row.seq, "key", &row.key)?,
+            before: optional_json(row.seq, "before", row.before.as_deref())?,
+            after: optional_json(row.seq, "after", row.after.as_deref())?,
         });
     }
     Ok(events)
@@ -165,8 +184,15 @@ struct OutboxRow {
     after: Option<String>,
 }
 
-fn parse_json(s: &str) -> Option<Value> {
-    serde_json::from_str(s).ok()
+fn required_json(seq: i64, field: &str, raw: &str) -> Result<Value> {
+    serde_json::from_str(raw).with_context(|| format!("_outbox seq {seq} {field} is not JSON"))
+}
+
+fn optional_json(seq: i64, field: &str, raw: Option<&str>) -> Result<Option<Value>> {
+    match raw {
+        None => Ok(None),
+        Some(s) => Ok(Some(required_json(seq, field, s)?)),
+    }
 }
 
 #[cfg(unix)]
@@ -203,16 +229,12 @@ pub fn serve(cfg: &CollectCfg) -> Result<()> {
 
 #[cfg(unix)]
 fn bind_sock(path: &Path) -> Result<std::os::unix::net::UnixDatagram> {
-    use std::os::unix::io::{FromRawFd, RawFd};
+    use std::os::unix::io::FromRawFd;
     use std::os::unix::net::UnixDatagram;
 
-    let listen_fds: i32 = std::env::var("LISTEN_FDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if listen_fds >= 1 {
-        let fd: RawFd = 3;
-        // SAFETY: systemd socket activation passes the datagram fd as fd 3.
+    if let Some(fd) = systemd_listen_fd() {
+        // SAFETY: systemd socket activation passes the datagram fd as fd 3
+        // when LISTEN_PID matches this process.
         let sock = unsafe { UnixDatagram::from_raw_fd(fd) };
         return Ok(sock);
     }
@@ -221,6 +243,32 @@ fn bind_sock(path: &Path) -> Result<std::os::unix::net::UnixDatagram> {
     }
     let _ = std::fs::remove_file(path);
     UnixDatagram::bind(path).with_context(|| format!("bind {}", path.display()))
+}
+
+#[cfg(unix)]
+fn systemd_listen_fd() -> Option<std::os::unix::io::RawFd> {
+    let listen_fds: i32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
+    if listen_fds < 1 {
+        return None;
+    }
+    let listen_pid: u32 = match std::env::var("LISTEN_PID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(pid) => pid,
+        None => {
+            tracing::warn!("ignoring LISTEN_FDS (LISTEN_PID unset)");
+            return None;
+        }
+    };
+    if listen_pid != std::process::id() {
+        tracing::warn!(
+            listen_pid,
+            "ignoring LISTEN_FDS (LISTEN_PID is not this process)"
+        );
+        return None;
+    }
+    Some(3)
 }
 
 #[cfg(test)]
@@ -358,5 +406,31 @@ mod tests {
     fn unknown_nudge_is_ok() {
         let (_d, cfg, _) = setup();
         assert!(drain_named(&cfg, "no-such-db").unwrap().is_none());
+    }
+
+    #[test]
+    fn drain_rejects_malformed_key_json() {
+        let (_d, cfg, sqlite) = setup();
+        insert_row(&sqlite, "trips", "I", "not-json", r#"{"ok":true}"#);
+        let err = drain_all(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("not JSON") || err.contains("adsb-trip-journal"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn drain_all_attempts_remaining_dbs_then_errors() {
+        let (_d, cfg, sqlite) = setup();
+        insert_row(&sqlite, "trips", "I", r#"{"id":1}"#, r#"{"id":1}"#);
+        fs::write(
+            cfg.announce_dir.join("broken.json"),
+            r#"{"db_name":"broken","sqlite_path":"/no/such/work.sqlite"}"#,
+        )
+        .unwrap();
+        let err = drain_all(&cfg).unwrap_err().to_string();
+        assert!(err.contains("broken"), "{err}");
+        let files = spool::list_jsonl(&cfg.spool_dir).unwrap();
+        assert_eq!(files.len(), 1);
     }
 }

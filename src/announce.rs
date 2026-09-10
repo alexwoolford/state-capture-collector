@@ -49,8 +49,53 @@ fn load_file(path: &Path) -> Result<Announce> {
     let a: Announce = serde_json::from_str(&text)
         .with_context(|| format!("parse announce {}", path.display()))?;
     validate_db_name(&a.db_name)?;
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    if stem != a.db_name {
+        anyhow::bail!(
+            "announce {} db_name {:?} does not match filename",
+            path.display(),
+            a.db_name
+        );
+    }
     if a.sqlite_path.is_empty() {
         anyhow::bail!("sqlite_path empty in {}", path.display());
     }
     Ok(a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn load_dir_skips_filename_db_name_mismatch() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("foo.json"),
+            r#"{"db_name":"bar","sqlite_path":"/tmp/work.sqlite"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("ok.json"),
+            r#"{"db_name":"ok","sqlite_path":"/tmp/ok.sqlite"}"#,
+        )
+        .unwrap();
+        let loaded = load_dir(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].db_name, "ok");
+    }
+
+    #[test]
+    fn load_named_rejects_mismatched_db_name() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("foo.json"),
+            r#"{"db_name":"bar","sqlite_path":"/tmp/work.sqlite"}"#,
+        )
+        .unwrap();
+        let err = load_named(dir.path(), "foo").unwrap_err().to_string();
+        assert!(err.contains("does not match filename"), "{err}");
+    }
 }
