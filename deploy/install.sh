@@ -47,7 +47,7 @@ echo "== socket group =="
 if ! getent group state-capture >/dev/null; then
   groupadd --system state-capture
 fi
-for u in faa tails adsb entra; do
+for u in faa tails adsb entra bgp edgar; do
   if id "$u" >/dev/null 2>&1; then
     usermod -aG state-capture "$u"
   fi
@@ -61,7 +61,9 @@ if [[ ! -f "$ENV_DST" ]]; then
   install -m 0600 "$ROOT/deploy/state-capture.env.example" "$ENV_DST"
 fi
 chmod 0600 "$ENV_DST"
-chmod 0755 "$STATE" "$STATE/announce" "$STATE/spool"
+chmod 0755 "$STATE" "$STATE/spool"
+chgrp state-capture "$STATE/announce" || true
+chmod 2775 "$STATE/announce"
 
 install -m 0644 "$ROOT/deploy/systemd/state-capture-collect.service" /etc/systemd/system/state-capture-collect.service
 install -m 0644 "$ROOT/deploy/systemd/state-capture-collect.socket" /etc/systemd/system/state-capture-collect.socket
