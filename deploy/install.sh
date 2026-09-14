@@ -47,7 +47,7 @@ echo "== socket group =="
 if ! getent group state-capture >/dev/null; then
   groupadd --system state-capture
 fi
-for u in faa tails adsb entra bgp edgar; do
+for u in faa tails adsb entra bgp edgar form4; do
   if id "$u" >/dev/null 2>&1; then
     usermod -aG state-capture "$u"
   fi

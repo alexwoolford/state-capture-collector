@@ -77,7 +77,7 @@ Do not `UPDATE col=col` to storm triggers. Do not copy work sqlite to the Mini. 
 
 Env: `/opt/state-capture-collector/etc/state-capture.env` (not overwritten on reinstall). Paths only (`STATE_CAPTURE_SOCK`, `STATE_CAPTURE_ANNOUNCE_DIR`, `STATE_CAPTURE_SPOOL_DIR`).
 
-The datagram is group-scoped (`SocketGroup=state-capture`, mode `0660`). `install.sh` creates that group and adds each utility user that exists on the host (`faa`, `tails`, `adsb`, `entra`, `bgp`, `edgar`). A further utility needs the same group membership or the nudge gets `EACCES` (same as a missing socket: `_outbox` stays until the 60s tick). The service still runs as root so it can prune `_outbox` in each owner's work file. Postgres is **not** configured on this host. There is no `DATABASE_URL`.
+The datagram is group-scoped (`SocketGroup=state-capture`, mode `0660`). `install.sh` creates that group and adds each utility user that exists on the host (`faa`, `tails`, `adsb`, `entra`, `bgp`, `edgar`, `form4`). A further utility needs the same group membership or the nudge gets `EACCES` (same as a missing socket: `_outbox` stays until the 60s tick). The service still runs as root so it can prune `_outbox` in each owner's work file. Postgres is **not** configured on this host. There is no `DATABASE_URL`.
 
 Spool files: `/var/lib/state-capture/spool/{src_db}/{seq_lo}-{seq_hi}.jsonl` (tmp + fsync + rename). Mini rsyncs `*.jsonl` only.
 
