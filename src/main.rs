@@ -61,6 +61,10 @@ struct CollectArgs {
     /// With `--snapshot --db`, reserve seq above this (Mini watermark may be ahead).
     #[arg(long, requires = "db")]
     min_seq: Option<i64>,
+    /// With `--snapshot`, re-emit a captured table larger than 100_000 rows.
+    /// Without this flag that database is refused and nothing is written.
+    #[arg(long, requires = "snapshot")]
+    allow_large: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -93,6 +97,8 @@ fn main() -> Result<()> {
                 tick: Duration::from_secs(a.tick_secs),
                 snapshot_db: a.db,
                 min_seq: a.min_seq,
+                snapshot_row_cap: snapshot::SNAPSHOT_ROW_CAP,
+                allow_large: a.allow_large,
             };
             if a.snapshot {
                 let stats = snapshot::snapshot_all(&cfg)?;
@@ -167,5 +173,15 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("snapshot") || msg.contains("db"), "{msg}");
+    }
+
+    #[test]
+    fn allow_large_requires_snapshot() {
+        let err = Cli::try_parse_from(["state-capture", "collect", "--allow-large"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("allow-large") && msg.contains("snapshot"),
+            "{msg}"
+        );
     }
 }

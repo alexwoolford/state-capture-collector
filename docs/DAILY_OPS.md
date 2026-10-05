@@ -65,7 +65,7 @@ ls /var/lib/state-capture/spool/
 
 `capture.current` is incremental from when capture was enabled. After a feed break, or the first time a populated sqlite is captured, re-snapshot current rows into the spool (continues `_outbox` seq so later triggers cannot collide). Mini apply is unchanged.
 
-`collect --snapshot` takes `BEGIN IMMEDIATE` on **that** work sqlite (writers blocked until commit), drains `_outbox` into the spool, then emits `I` events for current rows of each `_cap_I_*` table. `--db` snapshots only that announce name (does not drain sibling databases). `--min-seq` requires `--db`.
+`collect --snapshot` takes `BEGIN IMMEDIATE` on **that** work sqlite (writers blocked until commit), drains `_outbox` into the spool, then emits `I` events for current rows of each `_cap_I_*` table. `--db` snapshots only that announce name (does not drain sibling databases). `--min-seq` requires `--db`. A captured table with more than 100_000 rows is refused unless `--allow-large` is set, and that refusal writes nothing for the database.
 
 ```bash
 sudo /opt/state-capture-collector/bin/state-capture collect --snapshot
@@ -143,7 +143,7 @@ Low millions of JSONB rows are fine. `events_d_key` made new `I`/`U` cheap. Mini
 | Oracle spool | Yes, after Mini apply | `/var/lib/state-capture/spool/{src_db}/{lo}-{hi}.jsonl` until `forget-spool.sh` removes the paths Mini just applied. |
 | `capture.events` | **No** | Append-only CDC log. Years of ticker/ads-b/entra is modest. Repeating FAA `--snapshot` is not. |
 
-Steady-state CDC (ads-b, ticker, entra) at 10× is noise next to one FAA snapshot. Do not `collect --snapshot` on `faa-registry-mirror` to refresh dictionaries.
+Steady-state CDC (ads-b, ticker, entra) at 10× is noise next to one FAA snapshot. Do not `collect --snapshot` on `faa-registry-mirror` to refresh dictionaries. A captured table over 100_000 rows is refused unless `--allow-large`.
 
 **Do not** delete spool files because `hi <= capture.watermarks.last_seq` — watermark is max seq, not a contiguous fill. **Do not** `find -mtime +14 -delete` while Mini might be behind; `_outbox` is already gone and the JSONL is the remaining copy.
 
