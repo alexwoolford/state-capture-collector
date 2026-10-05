@@ -12,6 +12,9 @@
 //!
 //! Does not `UPDATE col=col` (that would look like real changes). Does not
 //! open sqlite from the Mini.
+//!
+//! A captured table with more than [`SNAPSHOT_ROW_CAP`] rows is refused, and
+//! that database writes nothing, unless `CollectCfg::allow_large` is set.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,6 +27,10 @@ use crate::announce;
 use crate::collect::{self, CollectCfg, DrainStats};
 use crate::event::{validate_db_name, Event};
 use crate::spool;
+
+/// `--snapshot` refuses a captured table larger than this unless `--allow-large`.
+/// One FAA MASTER copy is ~317k rows; dictionaries and trickles sit under this.
+pub const SNAPSHOT_ROW_CAP: i64 = 100_000;
 
 pub fn snapshot_all(cfg: &CollectCfg) -> Result<Vec<DrainStats>> {
     if let Some(name) = cfg.snapshot_db.as_deref() {
@@ -41,7 +48,7 @@ pub fn snapshot_all(cfg: &CollectCfg) -> Result<Vec<DrainStats>> {
             Ok(None) => {}
             Err(e) => {
                 tracing::error!(db = %a.db_name, error = %e, "snapshot failed");
-                failed.push(a.db_name);
+                failed.push(format!("{}: {e}", a.db_name));
             }
         }
     }
@@ -99,9 +106,13 @@ fn snapshot_locked(
         floor_outbox_seq(conn, min)?;
     }
 
+    let tables = captured_tables(conn)?;
+    // Count before drain or emit. A refusal rolls this transaction back and
+    // leaves the spool empty, including any pending `_outbox` rows.
+    enforce_snapshot_cap(cfg, src_db, conn, &tables)?;
+
     let drained = collect::drain_conn(cfg, src_db, conn)?;
 
-    let tables = captured_tables(conn)?;
     if tables.is_empty() {
         tracing::warn!(db = %src_db, "no _cap_I_* triggers; nothing to snapshot");
         return Ok(drained);
@@ -155,6 +166,43 @@ struct CapturedTable {
     pk: Vec<String>,
     payload: Vec<String>,
     without_rowid: bool,
+}
+
+fn enforce_snapshot_cap(
+    cfg: &CollectCfg,
+    src_db: &str,
+    conn: &Connection,
+    tables: &[CapturedTable],
+) -> Result<()> {
+    for table in tables {
+        let n = count_table(conn, &table.name)?;
+        if n <= cfg.snapshot_row_cap {
+            continue;
+        }
+        if cfg.allow_large {
+            tracing::warn!(
+                db = %src_db,
+                tbl = %table.name,
+                rows = n,
+                cap = cfg.snapshot_row_cap,
+                "snapshot allow-large"
+            );
+            continue;
+        }
+        bail!(
+            "snapshot refused: {src_db}.{} has {n} rows (cap {}); pass --allow-large only for a backfill",
+            table.name,
+            cfg.snapshot_row_cap
+        );
+    }
+    Ok(())
+}
+
+fn count_table(conn: &Connection, name: &str) -> Result<i64> {
+    validate_ident(name)?;
+    let sql = format!("SELECT count(*) FROM \"{name}\"");
+    conn.query_row(&sql, [], |r| r.get(0))
+        .with_context(|| format!("count {name}"))
 }
 
 fn captured_tables(conn: &Connection) -> Result<Vec<CapturedTable>> {
@@ -582,6 +630,8 @@ mod tests {
             tick: std::time::Duration::from_secs(60),
             snapshot_db: None,
             min_seq: None,
+            snapshot_row_cap: SNAPSHOT_ROW_CAP,
+            allow_large: false,
         };
         (dir, cfg, sqlite)
     }
@@ -689,5 +739,41 @@ mod tests {
             .iter()
             .any(|p| fs::read_to_string(p).unwrap().contains("secret"));
         assert!(!secret_leaked);
+    }
+
+    #[test]
+    fn snapshot_refuses_table_over_cap_and_writes_nothing() {
+        let (_d, mut cfg, sqlite) = setup();
+        cfg.snapshot_row_cap = 1;
+        Connection::open(&sqlite)
+            .unwrap()
+            .execute(
+                "INSERT INTO _outbox (tbl, op, ts, key, after) VALUES ('jobs', 'U', 1, '{}', '{}')",
+                [],
+            )
+            .unwrap();
+        let err = snapshot_all(&cfg).unwrap_err().to_string();
+        assert!(err.contains("demo.jobs"), "{err}");
+        assert!(err.contains("has 2 rows"), "{err}");
+        assert!(err.contains("cap 1"), "{err}");
+        assert!(err.contains("allow-large"), "{err}");
+        assert!(spool::list_jsonl(&cfg.spool_dir).unwrap().is_empty());
+        let left: i64 = Connection::open(&sqlite)
+            .unwrap()
+            .query_row("SELECT count(*) FROM _outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1);
+    }
+
+    #[test]
+    fn snapshot_allow_large_emits_table_over_cap() {
+        let (_d, mut cfg, _sqlite) = setup();
+        cfg.snapshot_row_cap = 1;
+        cfg.allow_large = true;
+        let stats = snapshot_all(&cfg).unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].rows, 2);
+        let files = spool::list_jsonl(&cfg.spool_dir).unwrap();
+        assert_eq!(files.len(), 1);
     }
 }

@@ -20,6 +20,11 @@ pub struct CollectCfg {
     pub snapshot_db: Option<String>,
     /// Floor for reserved `_outbox` seq (Mini watermark may be ahead of sqlite).
     pub min_seq: Option<i64>,
+    /// `--snapshot` refuses a captured table with more rows than this unless
+    /// `allow_large`. The binary passes [`crate::snapshot::SNAPSHOT_ROW_CAP`].
+    pub snapshot_row_cap: i64,
+    /// With `--snapshot`, re-emit a captured table over `snapshot_row_cap`.
+    pub allow_large: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -313,6 +318,8 @@ mod tests {
             tick: Duration::from_secs(60),
             snapshot_db: None,
             min_seq: None,
+            snapshot_row_cap: crate::snapshot::SNAPSHOT_ROW_CAP,
+            allow_large: false,
         };
         (dir, cfg, sqlite)
     }
